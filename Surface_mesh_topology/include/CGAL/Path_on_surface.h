@@ -23,6 +23,8 @@
 #include <utility>
 #include <string>
 #include <vector>
+#include <stack>
+#include <queue>
 #include <iostream>
 #include <sstream>
 #include <initializer_list>
@@ -52,14 +54,26 @@ public:
   typedef typename Map::Dart_const_handle    Dart_const_handle;
 
   typedef Dart_const_handle halfedge_descriptor; // To be compatible with BGL
+  
+  // Types used in DFS
+  typedef typename Map::template Dart_of_cell_range<0> Dart_of_vertex_range;
+  typedef typename Dart_of_vertex_range::const_iterator
+            Dart_of_vertex_const_handle;
+  typedef typename std::pair<
+      Dart_of_vertex_const_handle,
+      Dart_of_vertex_const_handle> DFS_iter;
 
-  Path_on_surface(const Mesh& amesh) : m_map(amesh), m_is_closed(false)
+  Path_on_surface(const Mesh& amesh) :
+    m_map(amesh),
+    m_is_closed(false),
+    m_is_T_computed(false)
   {}
 
   template<class COST>
   Path_on_surface(const internal::Path_on_surface_with_rle<COST>& apath) :
     m_map(apath.get_map()),
-    m_is_closed(apath.is_closed())
+    m_is_closed(apath.is_closed()),
+    m_is_T_computed(false)
   {
     for (auto it=apath.m_path.begin(), itend=apath.m_path.end(); it!=itend; ++it)
     {
@@ -76,8 +90,14 @@ public:
   Path_on_surface(const Self& apath) : m_map(apath.m_map),
                                        m_path(apath.m_path),
                                        m_is_closed(apath.m_is_closed),
-                                       m_flip(apath.m_flip)
+                                       m_flip(apath.m_flip),
+                                       m_is_T_computed(false)
   {}
+
+  ~Path_on_surface()
+  {
+    if (m_is_T_computed) { get_map().free_mark(m_mark_T); }
+  }
   
   void swap(Self& p2)
   {
@@ -274,6 +294,19 @@ public:
     CGAL_assertion(!is_empty());
     return get_ith_real_dart(length()-1);
   }
+
+  /// @return a dart containing the extremity represented by the first dart
+  /// of the path, taking into account flip.
+  /// @pre !is_empty()
+  Dart_const_handle front_extremity() const
+  { return (front_flip()?get_map().other_extremity(front()):front()); }
+  
+  /// @return a dart containing the extremity represented by the last dart
+  /// of the path, taking into account flip.
+  /// @pre !is_empty()
+  Dart_const_handle back_extremity() const
+  { return (back_flip()?back():get_map().other_extremity(back())); }
+
 
   /// @return true iff df can be added at the end of the path.
   bool can_be_pushed(Dart_const_handle dh, bool flip=false) const
@@ -1083,6 +1116,47 @@ public:
     { m_flip[i]=!m_flip[i]; }
   }
 
+  /// Compute a spanning tree T on the mesh
+  void compute_T()
+  {
+    if (!m_is_T_computed)
+    {
+      Dart_const_handle dh;
+      m_mark_T=get_map().get_new_mark();
+      auto grey=get_map().get_new_mark();
+      std::queue<Dart_const_handle> queue;
+      get_map().template mark_cell<0>(get_map().darts().begin(), grey);
+      queue.push(get_map().darts().begin());
+
+      while (!queue.empty())
+      {
+        dh=queue.front();
+        queue.pop();
+        for (auto it=get_map().template darts_of_cell<0>(dh).begin(),
+              itend=get_map().template darts_of_cell<0>(dh).end();
+                it!=itend; ++it)
+        {
+          if(!get_map().is_marked(get_map().template beta<1>(it), grey))
+          {
+            /// Mark the dart and the opposite dart (if any) in the tree
+            get_map().mark(it, m_mark_T);
+            if(!get_map().template is_free<2>(it))
+            { get_map().mark(get_map().template beta<2>(it), m_mark_T); }
+
+            /// Mark as visited
+            get_map().template mark_cell<0>
+                (get_map().template beta<1>(it), grey);
+
+            queue.push(get_map().template beta<1>(it));
+          }
+        }
+      }
+      CGAL_assertion(get_map().is_whole_map_marked(grey));
+      get_map().free_mark(grey);
+      m_is_T_computed=true;
+    }
+  }
+
   /// If the given path is opened, close it by doing the same path that the
   /// first one in reverse direction.
   void close()
@@ -1091,6 +1165,91 @@ public:
     {
       for (int i=m_path.size()-1; i>=0; --i)
       { m_path.push_back(m_path[i], !m_flip[i], false); }
+      m_is_closed=true;
+    }
+  }
+
+
+  /// If the given path is opened, close it by appending the path connecting
+  /// the two extremities on the spanning tree.
+  void close_on_spanning_tree()
+  {
+    CGAL_assertion(!is_empty());
+    if (!is_closed())
+    {
+      compute_T();
+      Dart_const_handle root_dh=get_map().darts().begin();
+
+      /// Treat the spanning tree as rooted at 0-cell of darts().front(). We
+      /// find two paths from root to the two extremities and then splice
+      /// them.
+      std::stack<DFS_iter> iterator_stack;
+      std::deque<Dart_const_handle> path_stack;
+      std::vector<Dart_const_handle> path_root_to_front, path_root_to_back;
+      int split_index=0;
+
+      bool found_front=get_map().template belong_to_same_cell<0>
+              (front_extremity(), root_dh),
+           found_back=get_map().template belong_to_same_cell<0>
+              (back_extremity(), root_dh);
+
+      iterator_stack.push(
+          std::make_pair(
+            get_map().template darts_of_cell<0>(root_dh).begin(),
+            get_map().template darts_of_cell<0>(root_dh).end()));
+      path_stack.push_back(nullptr);
+      
+      /// DFS
+      while (!iterator_stack.empty() && !(found_front && found_back))
+      {
+        auto& top=iterator_stack.top();
+        if (top.first==top.second)
+        { iterator_stack.pop(); path_stack.pop_back(); }
+        else if (get_map().is_marked(top.first, m_mark_T) &&
+                  !get_map().template belong_to_same_cell<1>
+                    (top.first, path_stack.back()))
+        {
+          Dart_const_handle dnext = get_map().template beta<1>(top.first);
+          path_stack.push_back(top.first);
+          ++top.first;
+          iterator_stack.push(
+              std::make_pair(
+                get_map().template darts_of_cell<0>(dnext).begin(),
+                get_map().template darts_of_cell<0>(dnext).end()));
+
+          if (get_map().template belong_to_same_cell<0>
+                (front_extremity(), dnext))
+          {
+            found_front=true;
+            std::copy(path_stack.begin()+1, path_stack.end(),
+                std::back_inserter(path_root_to_front));
+          }
+
+          if (get_map().template belong_to_same_cell<0>
+                (back_extremity(), dnext))
+          {
+            found_back=true;
+            std::copy(path_stack.begin()+1, path_stack.end(),
+                std::back_inserter(path_root_to_back));
+          }
+        }
+        else
+        { ++top.first; }
+      }
+
+      CGAL_assertion(found_front && found_back);
+      
+      /// Walk alone two path until they split
+      while (split_index<path_root_to_front.size() &&
+            split_index<path_root_to_back.size() &&
+            path_root_to_front[split_index]==path_root_to_back[split_index])
+      { ++split_index; }
+
+      for (int i=path_root_to_back.size()-1; i>=split_index; --i)
+      { push_back(path_root_to_back[i], true, false); }
+      for (int i=split_index; i<path_root_to_front.size(); ++i)
+      { push_back(path_root_to_front[i], false, false); }
+
       m_is_closed=true;
     }
   }
@@ -1257,6 +1416,8 @@ protected:
   std::vector<Dart_const_handle> m_path; /// The sequence of darts
   bool m_is_closed;                      /// True iff the path is a cycle
   std::vector<bool> m_flip;              /// The sequence of flips
+  bool m_is_T_computed;
+  std::size_t m_mark_T;
 };
 
 } // namespace Surface_mesh_topology
